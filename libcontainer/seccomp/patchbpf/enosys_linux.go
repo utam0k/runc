@@ -20,7 +20,13 @@ import (
 
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/utils"
+	"github.com/utam0k/gvisor/pkg/abi/linux"
+	gseccomp "github.com/utam0k/gvisor/pkg/seccomp"
 )
+
+// #include <stdlib.h>
+// #include <seccomp.h>
+import "C"
 
 // #cgo pkg-config: libseccomp
 /*
@@ -605,11 +611,12 @@ func generatePatch(config *configs.Seccomp) ([]bpf.Instruction, error) {
 	return stubProgram, nil
 }
 
-func enosysPatchFilter(config *configs.Seccomp, filter *libseccomp.ScmpFilter) ([]unix.SockFilter, error) {
-	program, err := disassembleFilter(filter)
-	if err != nil {
-		return nil, fmt.Errorf("error disassembling original filter: %w", err)
-	}
+func enosysPatchFilter(config *configs.Seccomp, program []bpf.Instruction) ([]unix.SockFilter, error) {
+	// // TODO: ここに[]bpf.Instructionを渡す
+	// program, err := disassembleFilter(filter)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("error disassembling original filter: %w", err)
+	// }
 
 	patch, err := generatePatch(config)
 	if err != nil {
@@ -630,6 +637,7 @@ func enosysPatchFilter(config *configs.Seccomp, filter *libseccomp.ScmpFilter) (
 	return fprog, nil
 }
 
+// TODO: 移行できる？
 func filterFlags(config *configs.Seccomp, filter *libseccomp.ScmpFilter) (flags uint, noNewPrivs bool, err error) {
 	// Ignore the error since pre-2.4 libseccomp is treated as API level 0.
 	apiLevel, _ := libseccomp.GetAPI()
@@ -694,14 +702,67 @@ func sysSeccompSetFilter(flags uint, filter []unix.SockFilter) (fd int, err erro
 	return
 }
 
-// PatchAndLoad takes a seccomp configuration and a libseccomp filter which has
-// been pre-configured with the set of rules in the seccomp config. It then
-// patches said filter to handle -ENOSYS in a much nicer manner than the
-// default libseccomp default action behaviour, and loads the patched filter
-// into the kernel for the current process.
-func PatchAndLoad(config *configs.Seccomp, filter *libseccomp.ScmpFilter) (int, error) {
-	// Generate a patched filter.
-	fprog, err := enosysPatchFilter(config, filter)
+func PatchAndLoad2(config *configs.Seccomp, filter *libseccomp.ScmpFilter) (int, error) {
+	ruleSets := []gseccomp.RuleSet{}
+	for _, call := range config.Syscalls {
+		if call == nil {
+			continue
+		}
+
+		sysno, err := GetSyscallFromName(call.Name)
+		if err != nil {
+			logrus.Debugf("unknown seccomp syscall %q ignored", call.Name)
+			return -1, err
+		}
+
+		callAct, err := getAction(call.Action, call.ErrnoRet)
+		if err != nil {
+			return -1, fmt.Errorf("action in seccomp profile is invalid: %w", err)
+		}
+
+		rules := []gseccomp.Rule{}
+		for _, cond := range call.Args {
+			op, err := getOperator(cond.Op, cond)
+			if err != nil {
+				return -1, fmt.Errorf("error creating seccomp syscall condition for syscall %s: %w", call.Name, err)
+			}
+			rules = append(rules, gseccomp.Rule{op})
+		}
+
+		ruleSet := gseccomp.RuleSet{
+			Rules: gseccomp.SyscallRules{
+				uintptr(sysno): rules,
+			},
+			Action: callAct,
+		}
+		ruleSets = append(ruleSets, ruleSet)
+	}
+
+	defaultAct, err := getAction(config.DefaultAction, config.DefaultErrnoRet)
+	if err != nil {
+		return -1, fmt.Errorf("action in seccomp profile is invalid: %w", err)
+	}
+
+	// TODO: support another architecture
+	// https://github.com/google/gvisor/blob/f6ed4523dceb2f90b4894b1f696a474da0a5341f/pkg/seccomp/seccomp_rules.go#L33
+	// TODO: What is badArchAction?
+	bpfProg, err := gseccomp.BuildProgram(ruleSets, defaultAct, linux.SECCOMP_RET_KILL_THREAD)
+	if err != nil {
+		return -1, fmt.Errorf("unable to build the bpf program: %w", err)
+	}
+
+	fprog := []bpf.RawInstruction{}
+	for _, bpfInst := range bpfProg {
+		ri := bpf.RawInstruction{
+			Op: bpfInst.OpCode,
+			Jt: bpfInst.JumpIfTrue,
+			Jf: bpfInst.JumpIfFalse,
+			K:  bpfInst.K,
+		}
+		fprog = append(fprog, ri)
+	}
+
+	fprog, err = enosysPatchFilter(config, fprog)
 	if err != nil {
 		return -1, fmt.Errorf("error patching filter: %w", err)
 	}
@@ -728,4 +789,75 @@ func PatchAndLoad(config *configs.Seccomp, filter *libseccomp.ScmpFilter) (int, 
 	}
 
 	return fd, nil
+}
+
+type SysCallNo = int32
+
+func GetSyscallFromName(name string) (SysCallNo, error) {
+	cString := C.CString(name)
+	defer C.free(unsafe.Pointer(cString))
+
+	// TODO: Handle error
+	result := C.seccomp_syscall_resolve_name(cString)
+
+	return SysCallNo(result), nil
+}
+
+// https://github.com/google/gvisor/blob/f6ed4523dceb2f90b4894b1f696a474da0a5341f/pkg/abi/linux/seccomp.go#L46-L62
+func getAction(act configs.Action, errnoRet *uint) (linux.BPFAction, error) {
+	switch act {
+	case configs.Kill, configs.KillThread:
+		return linux.SECCOMP_RET_KILL_THREAD, nil
+	case configs.Errno:
+		// if errnoRet != nil {
+		// 	return libseccomp.ActErrno.SetReturnCode(int16(*errnoRet)), nil
+		// }
+		// return actErrno, nil
+		return linux.SECCOMP_RET_ERRNO, nil
+	case configs.Trap:
+		return linux.SECCOMP_RET_TRAP, nil
+	case configs.Allow:
+		return linux.SECCOMP_RET_ALLOW, nil
+	case configs.Trace:
+		// if errnoRet != nil {
+		// 	return libseccomp.ActTrace.SetReturnCode(int16(*errnoRet)), nil
+		// }
+		// return actTrace, nil
+		return linux.SECCOMP_RET_TRACE, nil
+		// case configs.Log:
+		// 	return libseccomp.ActLog, nil
+		// case configs.Notify:
+		// 	return libseccomp.ActNotify, nil
+		// case configs.KillProcess:
+		// 	return libseccomp.ActKillProcess, nil
+		// default:
+		// 	return libseccomp.ActInvalid, errors.New("invalid action, cannot use in rule")
+	default:
+		return linux.SECCOMP_RET_TRACE, nil
+	}
+}
+
+type CompareOperator interface {
+	String() string
+}
+
+func getOperator(op configs.Operator, arg *configs.Arg) (CompareOperator, error) {
+	switch op {
+	case configs.EqualTo:
+		return gseccomp.EqualTo(arg.Value), nil
+	case configs.NotEqualTo:
+		return gseccomp.NotEqual(arg.Value), nil
+	case configs.GreaterThan:
+		return gseccomp.GreaterThan(arg.Value), nil
+	case configs.GreaterThanOrEqualTo:
+		return gseccomp.GreaterThanOrEqual(arg.Value), nil
+	case configs.LessThan:
+		return gseccomp.LessThan(arg.Value), nil
+	case configs.LessThanOrEqualTo:
+		return gseccomp.LessThanOrEqual(arg.Value), nil
+	// case configs.MaskEqualTo:
+	// 	return gseccomp.CompareMaskedEqual, nil
+	default:
+		return nil, errors.New("invalid operator, cannot use in rule")
+	}
 }

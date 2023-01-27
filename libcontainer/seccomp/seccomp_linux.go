@@ -127,7 +127,8 @@ func InitSeccomp(config *configs.Seccomp) (int, error) {
 		}
 	}
 
-	seccompFd, err := patchbpf.PatchAndLoad(config, filter)
+	// seccompFd, err := patchbpf.PatchAndLoad(config, filter)
+	seccompFd, err := patchbpf.PatchAndLoad2(config, filter)
 	if err != nil {
 		return -1, fmt.Errorf("error loading seccomp filter into kernel: %w", err)
 	}
